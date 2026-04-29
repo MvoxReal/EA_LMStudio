@@ -4,6 +4,7 @@ Provides text generation using local LLM/VLM models via LM Studio server.
 """
 import logging
 import re
+import hashlib
 from typing import Optional, Tuple, List
 import os
 from tempfile import NamedTemporaryFile
@@ -93,6 +94,9 @@ class EALMStudio:
 
     Note: model.respond() automatically applies the model's chat template.
     """
+
+    _last_cache_key: Optional[str] = None
+    _last_result: Optional[Tuple[str, str]] = None
 
     CATEGORY = "EA/LMStudio"
     RETURN_TYPES = ("STRING", "STRING", "STRING")
@@ -423,6 +427,44 @@ class EALMStudio:
 
         return response_text.strip(), "\n---\n".join(reasoning_parts).strip()
 
+    def _build_inference_cache_key(
+        self,
+        system_message: str,
+        prompt: str,
+        model_identifier: str,
+        draft_model: Optional[str],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        repeat_penalty: float,
+        reasoning_mode: str,
+        custom_open_tag: str,
+        custom_close_tag: str,
+        pil_images: List[Image.Image],
+    ) -> str:
+        """Build a deterministic cache key for LM Studio inference inputs."""
+        payload_parts = [
+            system_message,
+            prompt,
+            model_identifier,
+            draft_model or "",
+            str(max_tokens),
+            str(temperature),
+            str(top_p),
+            str(top_k),
+            str(repeat_penalty),
+            reasoning_mode,
+            custom_open_tag,
+            custom_close_tag,
+        ]
+
+        for pil_img in pil_images:
+            img_hash = hashlib.sha256(pil_img.tobytes()).hexdigest()
+            payload_parts.append(f"{pil_img.size[0]}x{pil_img.size[1]}:{img_hash}")
+
+        return hashlib.sha256("\n".join(payload_parts).encode("utf-8")).hexdigest()
+
     def generate(
         self,
         system_message: str,
@@ -529,6 +571,27 @@ class EALMStudio:
         if pil_images:
             troubleshooting_lines.append(f"[INFO] Total images for VLM: {len(pil_images)}")
 
+        cache_key = self._build_inference_cache_key(
+            system_message=system_message,
+            prompt=prompt,
+            model_identifier=model_identifier,
+            draft_model=draft_model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            reasoning_mode=reasoning_mode,
+            custom_open_tag=custom_open_tag,
+            custom_close_tag=custom_close_tag,
+            pil_images=pil_images,
+        )
+
+        if EALMStudio._last_cache_key == cache_key and EALMStudio._last_result is not None:
+            troubleshooting_lines.append("[INFO] LM Studio inference skipped (cache hit: prompts and inference inputs unchanged)")
+            cached_response, cached_reasoning = EALMStudio._last_result
+            return cached_response, cached_reasoning, "\n".join(troubleshooting_lines)
+
         # Build inference request
         try:
             troubleshooting_lines.append("[INFO] Connecting to LM Studio...")
@@ -631,6 +694,8 @@ class EALMStudio:
                     except Exception as e:
                         troubleshooting_lines.append(f"[WARNING] Failed to unload LLM: {e}")
 
+                EALMStudio._last_cache_key = cache_key
+                EALMStudio._last_result = (final_response, reasoning)
                 return final_response, reasoning, "\n".join(troubleshooting_lines)
 
         except Exception as e:
